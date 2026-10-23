@@ -1,6 +1,0 @@
-{
-  "private": true,
-  "main": "../dist/surveys/index.js",
-  "module": "../dist/surveys/index.mjs",
-  "types": "../dist/surveys/index.d.ts"
-}
