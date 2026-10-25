@@ -12,7 +12,7 @@ const RESERVATION_HEADERS = [
   "Departure Date",
   "Total Nights",
   "Total Charge",
-  "Currency",
+  "Phone Number",
   "Status",
   "Calendar Event ID",
   "Notes",
@@ -26,11 +26,85 @@ type ReservationInput = {
   departureDate: string;
   totalNights: number;
   totalCharge: number;
-  currency: string;
+  phoneNumber: string;
   status: "pending" | "confirmed" | "cancelled" | "completed";
   notes?: string;
   calendarEventId?: string;
 };
+
+function reservationStayDescription(input: ReservationInput) {
+  return [
+    "BOOKING PERIOD",
+    `Reservation ID: ${input.reservationId}`,
+    `Guest: ${input.guestName}`,
+    `Check-in: ${displayDate(input.arrivalDate)}`,
+    `Check-out: ${displayDate(input.departureDate)}`,
+    `Total nights: ${input.totalNights}`,
+    `Phone Number: ${input.phoneNumber}`,
+    `Status: ${input.status}`,
+    `Notes: ${input.notes ?? ""}`,
+  ].join("\n");
+}
+
+
+function toCalendarDate(value: string): string {
+  const match = /^(\d{2})-(\d{2})-(\d{4})$/.exec(value);
+
+  if (!match) {
+    throw new Error("Date must be in DD-MM-YYYY format.");
+  }
+
+  const [, dd, mm, yyyy] = match;
+  const iso = `${yyyy}-${mm}-${dd}`;
+  const date = new Date(`${iso}T00:00:00.000Z`);
+
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.toISOString().slice(0, 10) !== iso
+  ) {
+    throw new Error(`Invalid date: ${value}`);
+  }
+
+  return iso;
+}
+
+function displayDate(value: string): string {
+  const iso = /^\d{4}-\d{2}-\d{2}$/.test(value)
+    ? value
+    : toCalendarDate(value);
+
+  const [year, month, day] = iso.split("-");
+  return `${day}-${month}-${year}`;
+}
+
+function nextCalendarDate(isoDate: string): string {
+  const date = new Date(`${isoDate}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + 1);
+  return date.toISOString().slice(0, 10);
+}
+
+function reservationEventDescription(
+  input: ReservationInput,
+  eventType: "CHECK-IN" | "CHECK-OUT",
+) {
+  const relevantDate =
+    eventType === "CHECK-IN"
+      ? input.arrivalDate
+      : input.departureDate;
+
+  return [
+    `${eventType} DATE: ${displayDate(relevantDate)}`,
+    `Reservation ID: ${input.reservationId}`,
+    `Guest: ${input.guestName}`,
+    `Check-in: ${displayDate(input.arrivalDate)}`,
+    `Check-out: ${displayDate(input.departureDate)}`,
+    `Total nights: ${input.totalNights}`,
+    `Phone Number: ${input.phoneNumber}`,
+    `Status: ${input.status}`,
+    `Notes: ${input.notes ?? ""}`,
+  ].join("\n");
+}
+
 
 function reservationDescription(input: ReservationInput) {
   return [
@@ -39,34 +113,96 @@ function reservationDescription(input: ReservationInput) {
     `Arrival: ${input.arrivalDate}`,
     `Departure: ${input.departureDate}`,
     `Nights: ${input.totalNights}`,
-    `Total charge: ${input.totalCharge} ${input.currency}`,
+    `Total charge: ${input.totalCharge}`,
+    `Phone : ${input.phoneNumber}`,
     `Status: ${input.status}`,
     `Notes: ${input.notes ?? ""}`,
   ].join("\n");
 }
 
 // Create an all-day event for the reservation.
+
+
 export async function createReservationCalendarEvent(
   input: ReservationInput & { authUserId: string },
 ) {
   const calendar = await calendarForUser(input.authUserId);
 
-  const response = await calendar.events.insert({
-    calendarId: "primary",
-    requestBody: {
-      summary: `Airbnb - ${input.guestName} - ${input.reservationId}`,
-      description: reservationDescription(input),
-      start: { date: input.arrivalDate },
-      end: { date: input.departureDate },
-    },
-  });
+  const arrival = toCalendarDate(input.arrivalDate);
+  const departure = toCalendarDate(input.departureDate);
 
-  return {
-    success: true,
-    calendarEventId: response.data.id,
-    htmlLink: response.data.htmlLink,
-    reservationId: input.reservationId,
-  };
+  if (departure <= arrival) {
+    throw new Error("Departure date must be later than arrival date.");
+  }
+
+  const createdIds: string[] = [];
+
+  try {
+    const checkIn = await calendar.events.insert({
+      calendarId: "primary",
+      requestBody: {
+        summary: `CHECK-IN - ${input.guestName} - ${input.reservationId}`,
+        description: reservationEventDescription(input, "CHECK-IN"),
+        start: { date: arrival },
+        end: { date: nextCalendarDate(arrival) },
+      },
+    });
+
+    if (!checkIn.data.id) {
+      throw new Error("Check-in event ID was not returned.");
+    }
+    createdIds.push(checkIn.data.id);
+
+    const checkOut = await calendar.events.insert({
+      calendarId: "primary",
+      requestBody: {
+        summary: `CHECK-OUT - ${input.guestName} - ${input.reservationId}`,
+        description: reservationEventDescription(input, "CHECK-OUT"),
+        start: { date: departure },
+        end: { date: nextCalendarDate(departure) },
+      },
+    });
+
+    if (!checkOut.data.id) {
+      throw new Error("Check-out event ID was not returned.");
+    }
+    createdIds.push(checkOut.data.id);
+
+    const booking = await calendar.events.insert({
+      calendarId: "primary",
+      requestBody: {
+        summary: `BOOKING - ${input.guestName} - ${input.reservationId}`,
+        description: reservationStayDescription(input),
+        start: { date: arrival },
+        end: { date: departure },
+      },
+    });
+
+    if (!booking.data.id) {
+      throw new Error("Booking event ID was not returned.");
+    }
+    createdIds.push(booking.data.id);
+
+    return {
+      success: true,
+      calendarEventId: createdIds.join(","),
+      checkInEventId: checkIn.data.id,
+      checkOutEventId: checkOut.data.id,
+      bookingEventId: booking.data.id,
+      reservationId: input.reservationId,
+    };
+  } catch (error) {
+    await Promise.allSettled(
+      createdIds.map((eventId) =>
+        calendar.events.delete({
+          calendarId: "primary",
+          eventId,
+        }),
+      ),
+    );
+
+    throw error;
+  }
 }
 
 // Update the existing event rather than creating a duplicate.
@@ -78,21 +214,80 @@ export async function updateReservationCalendarEvent(
 ) {
   const calendar = await calendarForUser(input.authUserId);
 
-  const response = await calendar.events.patch({
-    calendarId: "primary",
-    eventId: input.calendarEventId,
-    requestBody: {
-      summary: `Airbnb - ${input.guestName} - ${input.reservationId}`,
-      description: reservationDescription(input),
-      start: { date: input.arrivalDate },
-      end: { date: input.departureDate },
+  const arrival = toCalendarDate(input.arrivalDate);
+  const departure = toCalendarDate(input.departureDate);
+
+  if (departure <= arrival) {
+    throw new Error("Departure date must be later than arrival date.");
+  }
+
+  const ids = input.calendarEventId
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  if (ids.length === 0) {
+    throw new Error("No Calendar event ID was supplied.");
+  }
+
+  // Existing order: check-in, check-out, booking bar.
+  const eventDefinitions = [
+    {
+      summary: `CHECK-IN - ${input.guestName} - ${input.reservationId}`,
+      description: reservationEventDescription(input, "CHECK-IN"),
+      start: { date: arrival },
+      end: { date: nextCalendarDate(arrival) },
     },
-  });
+    {
+      summary: `CHECK-OUT - ${input.guestName} - ${input.reservationId}`,
+      description: reservationEventDescription(input, "CHECK-OUT"),
+      start: { date: departure },
+      end: { date: nextCalendarDate(departure) },
+    },
+    {
+      summary: `BOOKING - ${input.guestName} - ${input.reservationId}`,
+      description: reservationStayDescription(input),
+      start: { date: arrival },
+      end: { date: departure },
+    },
+  ];
+
+  const updatedIds: string[] = [];
+
+  for (let i = 0; i < eventDefinitions.length; i++) {
+    const eventId = ids[i];
+    const requestBody = eventDefinitions[i];
+
+    if (eventId) {
+      await calendar.events.patch({
+        calendarId: "primary",
+        eventId,
+        requestBody,
+      });
+
+      updatedIds.push(eventId);
+    } else {
+      const response = await calendar.events.insert({
+        calendarId: "primary",
+        requestBody,
+      });
+
+      if (!response.data.id) {
+        throw new Error(
+          `Calendar event ${i + 1} was not created successfully.`,
+        );
+      }
+
+      updatedIds.push(response.data.id);
+    }
+  }
 
   return {
     success: true,
-    calendarEventId: response.data.id,
-    htmlLink: response.data.htmlLink,
+    calendarEventId: updatedIds.join(","),
+    checkInEventId: updatedIds[0],
+    checkOutEventId: updatedIds[1],
+    bookingEventId: updatedIds[2],
     reservationId: input.reservationId,
   };
 }
@@ -103,14 +298,39 @@ export async function cancelReservationCalendarEvent(input: {
 }) {
   const calendar = await calendarForUser(input.authUserId);
 
-  await calendar.events.delete({
-    calendarId: "primary",
-    eventId: input.calendarEventId,
-  });
+  const eventIds = input.calendarEventId
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  if (eventIds.length === 0) {
+    throw new Error("No Calendar event IDs were supplied.");
+  }
+
+  const results = await Promise.allSettled(
+    eventIds.map((eventId) =>
+      calendar.events.delete({
+        calendarId: "primary",
+        eventId,
+      }),
+    ),
+  );
+
+  const failed = results
+    .map((result, index) => ({ result, eventId: eventIds[index] }))
+    .filter(({ result }) => result.status === "rejected");
+
+  if (failed.length > 0) {
+    throw new Error(
+      `Failed to cancel Calendar event(s): ${
+        failed.map(({ eventId }) => eventId).join(", ")
+      }. Other events may already have been cancelled.`,
+    );
+  }
 
   return {
     success: true,
-    calendarEventId: input.calendarEventId,
+    calendarEventIds: eventIds,
   };
 }
 
@@ -188,7 +408,7 @@ export async function appendReservationToSheet(
     input.departureDate,
     input.totalNights,
     input.totalCharge,
-    input.currency,
+    input.phoneNumber,
     input.status,
     input.calendarEventId ?? "",
     input.notes ?? "",
@@ -237,7 +457,7 @@ export async function updateReservationInSheet(input: {
   departureDate?: string;
   totalNights?: number;
   totalCharge?: number;
-  currency?: string;
+  phoneNumber?: string;
   status?: "pending" | "confirmed" | "cancelled" | "completed";
   calendarEventId?: string;
   notes?: string;
@@ -280,7 +500,7 @@ export async function updateReservationInSheet(input: {
     ["departureDate", 3],
     ["totalNights", 4],
     ["totalCharge", 5],
-    ["currency", 6],
+    ["phoneNumber", 6],
     ["status", 7],
     ["calendarEventId", 8],
     ["notes", 9],
@@ -294,34 +514,32 @@ export async function updateReservationInSheet(input: {
   updated[10] = new Date().toISOString();
 
   // Validate the final dates, not just the supplied changes.
-  const arrival = String(updated[2]);
-  const departure = String(updated[3]);
+  
+const arrival = toCalendarDate(String(updated[2]));
+const departure = toCalendarDate(String(updated[3]));
 
-  if (
-    !/^\d{4}-\d{2}-\d{2}$/.test(arrival) ||
-    !/^\d{4}-\d{2}-\d{2}$/.test(departure) ||
-    departure <= arrival
-  ) {
-    throw new Error("The resulting reservation dates are invalid.");
-  }
+if (departure <= arrival) {
+  throw new Error("Departure date must be later than arrival date.");
+}
 
-  const calculatedNights = Math.round(
-    (
-      Date.parse(`${departure}T00:00:00Z`) -
-      Date.parse(`${arrival}T00:00:00Z`)
-    ) / 86_400_000,
+const calculatedNights = Math.round(
+  (
+    Date.parse(`${departure}T00:00:00.000Z`) -
+    Date.parse(`${arrival}T00:00:00.000Z`)
+  ) / 86_400_000,
+);
+
+if (
+  input.totalNights !== undefined &&
+  input.totalNights !== calculatedNights
+) {
+  throw new Error(
+    "Total nights must match the arrival and departure dates.",
   );
+}
 
-  if (
-    input.totalNights !== undefined &&
-    input.totalNights !== calculatedNights
-  ) {
-    throw new Error(
-      "Total nights must match the arrival and departure dates.",
-    );
-  }
+updated[4] = calculatedNights;
 
-  updated[4] = calculatedNights;
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: input.spreadsheetId,
