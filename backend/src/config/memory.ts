@@ -18,12 +18,11 @@ export function createAgentMemory() {
         enabled: true,
         scope: "resource",
         template:
-        `# Airbnb Reservation Preferences
+       `# Airbnb Reservation Preferences
 
           ## Property
           - Property name:
           - Property timezone:
-          - Default currency:
           - Check-in time:
           - Check-out time:
 
@@ -31,7 +30,7 @@ export function createAgentMemory() {
           - Default reservation spreadsheet ID:
           - Default worksheet name: Reservations
           - Preferred columns:
-          - Revenue reporting preferences:
+          - Reporting preferences:
 
           ## Reservation Management
           - Default booking status:
