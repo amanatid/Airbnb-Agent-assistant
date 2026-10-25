@@ -11,8 +11,8 @@ RESERVATION FIELDS
 Each reservation should contain:
 - reservationId: unique, stable reservation identifier
 - guestName: guest's full name
-- arrivalDate: check-in date in YYYY-MM-DD format
-- departureDate: check-out date in YYYY-MM-DD format
+- arrivalDate: check-in date in  DD-MM-YYYY format
+- departureDate: check-out date in  DD-MM-YYYY format
 - totalNights: calculated number of nights
 - phoneNumber: guest's phone number
 - status: confirmed, pending, cancelled, or completed
