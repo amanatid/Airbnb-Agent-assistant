@@ -17,6 +17,7 @@ import {
   appendReservationToSheet,
   readReservationSheet,
   updateReservationInSheet,
+  syncAirbnbIcalReservations,
 } from "./calendar.service.js";
 
 //////////////////////////////////////////////////////////////
@@ -203,6 +204,26 @@ export function createReservationTools(authUserId: string) {
         await updateReservationInSheet({
           authUserId,
           ...input,
+        }),
+    }),
+
+    syncAirbnbIcalReservations: createTool({
+      id: "syncAirbnbIcalReservations",
+      description:
+       "Sync only Reserved stays from the configured Airbnb iCal feed " +
+    "to Google Calendar and the existing Google Sheets reservation register. " +
+    "Do not import blocked or unavailable dates. " +
+    "One-way sync only: Airbnb to Google Calendar and Google Sheets. " +
+    "Dates must be displayed as DD-MM-YYYY.",
+      inputSchema: z.object({
+        spreadsheetId: z.string().min(1),
+        icalUrl: z.string().url().describe("HTTPS Airbnb exported calendar (.ics) URL"),
+      }),
+      execute: async ({ spreadsheetId, icalUrl }) =>
+        await syncAirbnbIcalReservations({
+          authUserId,
+          spreadsheetId,
+          icalUrl,
         }),
     }),
 
