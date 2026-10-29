@@ -1,8 +1,8 @@
 import { google } from "googleapis";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getCalendarAccessToken, getSheetsAccessToken } from "./token.service.js";
 
-
+const AIRBNB_ICAL_URL = "https://www.airbnb.com/calendar/ical/784776861307018745.ics?t=59876bb49f494287a5384dca764b1203";
 
 //////////////////////////////////////////////////////
 const RESERVATION_HEADERS = [
@@ -47,17 +47,25 @@ function reservationStayDescription(input: ReservationInput) {
 }
 
 
+/**
+ * Normalize supported date strings to Google Calendar's YYYY-MM-DD format.
+ * Date-only values are handled as calendar dates, not local-time instants.
+ */
 function toCalendarDate(value: string): string {
-  const match = /^(\d{2})-(\d{2})-(\d{4})$/.exec(value);
+  let iso: string;
 
-  if (!match) {
-    throw new Error("Date must be in DD-MM-YYYY format.");
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    iso = value;
+  } else {
+    const match = /^(\d{2})-(\d{2})-(\d{4})$/.exec(value);
+    if (!match) {
+      throw new Error("Date must be in DD-MM-YYYY or YYYY-MM-DD format.");
+    }
+    const [, dd, mm, yyyy] = match;
+    iso = `${yyyy}-${mm}-${dd}`;
   }
 
-  const [, dd, mm, yyyy] = match;
-  const iso = `${yyyy}-${mm}-${dd}`;
   const date = new Date(`${iso}T00:00:00.000Z`);
-
   if (
     Number.isNaN(date.getTime()) ||
     date.toISOString().slice(0, 10) !== iso
@@ -68,13 +76,15 @@ function toCalendarDate(value: string): string {
   return iso;
 }
 
-function displayDate(value: string): string {
-  const iso = /^\d{4}-\d{2}-\d{2}$/.test(value)
-    ? value
-    : toCalendarDate(value);
-
+/** Format a supported date as DD-MM-YYYY for users and Google Sheets. */
+export function formatDateDDMMYYYY(value: string): string {
+  const iso = toCalendarDate(value);
   const [year, month, day] = iso.split("-");
   return `${day}-${month}-${year}`;
+}
+
+function displayDate(value: string): string {
+  return formatDateDDMMYYYY(value);
 }
 
 function nextCalendarDate(isoDate: string): string {
@@ -110,8 +120,8 @@ function reservationDescription(input: ReservationInput) {
   return [
     `Reservation ID: ${input.reservationId}`,
     `Guest: ${input.guestName}`,
-    `Arrival: ${input.arrivalDate}`,
-    `Departure: ${input.departureDate}`,
+    `Arrival: ${displayDate(input.arrivalDate)}`,
+    `Departure: ${displayDate(input.departureDate)}`,
     `Nights: ${input.totalNights}`,
     `Total charge: ${input.totalCharge}`,
     `Phone : ${input.phoneNumber}`,
@@ -404,8 +414,8 @@ export async function appendReservationToSheet(
   const row = [
     input.reservationId,
     input.guestName,
-    input.arrivalDate,
-    input.departureDate,
+    displayDate(input.arrivalDate),
+    displayDate(input.departureDate),
     input.totalNights,
     input.totalCharge,
     input.phoneNumber,
@@ -444,6 +454,261 @@ export async function readReservationSheet(input: {
 
   return {
     rows: response.data.values ?? [],
+  };
+}
+
+
+type AirbnbIcalEvent = {
+  uid: string;
+  startIso: string;
+  endIso: string;
+  summary: string;
+};
+
+function unescapeIcalText(value: string): string {
+  return value
+    .replace(/\\n/gi, "\n")
+    .replace(/\\,/g, ",")
+    .replace(/\\;/g, ";")
+    .replace(/\\\\/g, "\\");
+}
+
+function parseIcalDate(value: string): string | null {
+  // iCal date-only: YYYYMMDD; date-time values start with the same date.
+  const compact = /^(\d{4})(\d{2})(\d{2})/.exec(value.trim());
+  if (compact) {
+    return toCalendarDate(`${compact[1]}-${compact[2]}-${compact[3]}`);
+  }
+
+  const iso = /^(\d{4}-\d{2}-\d{2})/.exec(value.trim());
+  if (iso) return toCalendarDate(iso[1]);
+
+  return null;
+}
+
+function parseAirbnbIcal(icsText: string): AirbnbIcalEvent[] {
+  // RFC 5545 allows long lines to be folded onto the next line with whitespace.
+  const unfolded = icsText.replace(/\r?\n[ \t]/g, "");
+  const blocks = unfolded.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g) ?? [];
+  const events: AirbnbIcalEvent[] = [];
+
+  for (const block of blocks) {
+    const properties = new Map<string, string>();
+    for (const line of block.split(/\r?\n/)) {
+      const colon = line.indexOf(":");
+      if (colon < 0) continue;
+      const key = line.slice(0, colon).split(";")[0].toUpperCase();
+      const value = line.slice(colon + 1).trim();
+      if (!properties.has(key)) properties.set(key, value);
+    }
+
+    const uid = properties.get("UID");
+    const startRaw = properties.get("DTSTART");
+    const endRaw = properties.get("DTEND");
+    const status = properties.get("STATUS")?.toUpperCase();
+    if (!uid || !startRaw || !endRaw || status === "CANCELLED") continue;
+
+    let startIso: string | null;
+    let endIso: string | null;
+    try {
+      startIso = parseIcalDate(startRaw);
+      endIso = parseIcalDate(endRaw);
+    } catch {
+      // Ignore malformed calendar entries rather than corrupting the sheet.
+      continue;
+    }
+
+    if (!startIso || !endIso || endIso <= startIso) continue;
+
+    events.push({
+      uid: unescapeIcalText(uid),
+      startIso,
+      endIso,
+      summary: unescapeIcalText(properties.get("SUMMARY") ?? "Airbnb reservation"),
+    });
+  }
+
+  return events;
+}
+
+/**
+ * One-way import from an Airbnb iCal feed into the existing Reservations sheet
+ * and Google Calendar. iCal does not reliably provide guest names or charges,
+ * so those fields use an explicit placeholder/zero for newly imported rows.
+ */
+export async function syncAirbnbIcalReservations(input: {
+  authUserId: string;
+  spreadsheetId: string;
+  icalUrl: string; //AIRBNB_ICAL_UR //process.env.AIRBNB_ICAL_URL!, 
+}) {
+  let feedUrl: URL;
+  try {
+    feedUrl = new URL(input.icalUrl);
+  } catch {
+    throw new Error("The Airbnb iCal URL is invalid.");
+  }
+
+  // Avoid accepting arbitrary server-side URLs; only fetch Airbnb-hosted feeds.
+  if (
+    feedUrl.protocol !== "https:" ||
+    !(feedUrl.hostname === "airbnb.com" || feedUrl.hostname.endsWith(".airbnb.com"))
+  ) {
+    throw new Error("The iCal URL must be an HTTPS Airbnb calendar URL.");
+  }
+
+  const response = await fetch(feedUrl);
+  if (!response.ok) {
+    throw new Error(`Unable to fetch Airbnb iCal feed (HTTP ${response.status}).`);
+  }
+
+  const icsText = await response.text();
+  if (!icsText.includes("BEGIN:VCALENDAR")) {
+    throw new Error("The URL did not return a valid iCalendar feed.");
+  }
+
+  //const events = parseAirbnbIcal(icsText);
+  const events = parseAirbnbIcal(icsText).filter((event) => {
+  const summary = event.summary.trim();
+
+  return (
+    /\breserved\b/i.test(summary) &&
+    !/not available|blocked/i.test(summary)
+  );
+});
+  
+  const sheet = await readReservationSheet({
+    authUserId: input.authUserId,
+    spreadsheetId: input.spreadsheetId,
+  });
+  const rows = sheet.rows;
+  if (rows.length === 0) {
+    throw new Error(
+      "The reservation sheet is empty. Create/initialize the Reservations sheet before syncing.",
+    );
+  }
+
+  const existingById = new Map<string, string[]>();
+  for (const row of rows.slice(1)) {
+    if (row[0]) existingById.set(String(row[0]), row);
+  }
+
+  let created = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  for (const event of events) {
+    const reservationId =
+      "airbnb-" +
+      createHash("sha256").update(event.uid).digest("hex").slice(0, 16);
+    const arrivalDate = formatDateDDMMYYYY(event.startIso);
+    const departureDate = formatDateDDMMYYYY(event.endIso);
+    const totalNights = Math.round(
+      (Date.parse(`${event.endIso}T00:00:00.000Z`) -
+        Date.parse(`${event.startIso}T00:00:00.000Z`)) /
+        86_400_000,
+    );
+    const existing = existingById.get(reservationId);
+    const guestName =
+      (existing?.[1] && String(existing[1]).trim()) ||
+      "Airbnb guest (name unavailable)";
+    const notes = [
+      "Imported from Airbnb iCal. Guest details and price are not provided by the feed.",
+      `iCal summary: ${event.summary}`,
+      `iCal UID: ${event.uid}`,
+    ].join("\n");
+
+    if (existing) {
+      const oldEventIds = String(existing[8] ?? "").trim();
+      let calendarEventId = oldEventIds;
+
+      if (oldEventIds) {
+        const calendarResult = await updateReservationCalendarEvent({
+          authUserId: input.authUserId,
+          reservationId,
+          guestName,
+          arrivalDate,
+          departureDate,
+          totalNights,
+          totalCharge: Number(existing[5] ?? 0) || 0,
+          phoneNumber: String(existing[6] ?? ""),
+          status: "confirmed",
+          notes,
+          calendarEventId: oldEventIds,
+        });
+        calendarEventId = calendarResult.calendarEventId;
+      } else {
+        const calendarResult = await createReservationCalendarEvent({
+          authUserId: input.authUserId,
+          reservationId,
+          guestName,
+          arrivalDate,
+          departureDate,
+          totalNights,
+          totalCharge: Number(existing[5] ?? 0) || 0,
+          phoneNumber: String(existing[6] ?? ""),
+          status: "confirmed",
+          notes,
+        });
+        calendarEventId = calendarResult.calendarEventId;
+      }
+
+      await updateReservationInSheet({
+        authUserId: input.authUserId,
+        spreadsheetId: input.spreadsheetId,
+        reservationId,
+        guestName,
+        arrivalDate,
+        departureDate,
+        totalNights,
+        status: "confirmed",
+        calendarEventId,
+        notes,
+      });
+      updated += 1;
+      continue;
+    }
+
+    const calendarResult = await createReservationCalendarEvent({
+      authUserId: input.authUserId,
+      reservationId,
+      guestName,
+      arrivalDate,
+      departureDate,
+      totalNights,
+      totalCharge: 0,
+      phoneNumber: "",
+      status: "confirmed",
+      notes,
+    });
+
+    await appendReservationToSheet({
+      authUserId: input.authUserId,
+      spreadsheetId: input.spreadsheetId,
+      reservationId,
+      guestName,
+      arrivalDate,
+      departureDate,
+      totalNights,
+      totalCharge: 0,
+      phoneNumber: "",
+      status: "confirmed",
+      notes,
+      calendarEventId: calendarResult.calendarEventId,
+    });
+
+    created += 1;
+  }
+
+  return {
+    success: true,
+    source: "Airbnb iCal",
+    importedEvents: events.length,
+    created,
+    updated,
+    skipped,
+    dateFormat: "DD-MM-YYYY",
+    note:
+      "iCal supplies dates/availability only. Guest names and charges are not available unless Airbnb includes them in the feed.",
   };
 }
 
@@ -517,6 +782,10 @@ export async function updateReservationInSheet(input: {
   
 const arrival = toCalendarDate(String(updated[2]));
 const departure = toCalendarDate(String(updated[3]));
+
+// Keep the existing sheet columns, but normalize date values for display.
+updated[2] = formatDateDDMMYYYY(arrival);
+updated[3] = formatDateDDMMYYYY(departure);
 
 if (departure <= arrival) {
   throw new Error("Departure date must be later than arrival date.");
